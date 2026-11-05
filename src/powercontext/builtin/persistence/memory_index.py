@@ -247,14 +247,6 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
-        if request.mode == "hybrid":
-            # One native statement may serve both channels. It is preferred
-            # because the database then plans the lexical and the vector
-            # candidate queries together.
-            for index in self.indexes:
-                combined = getattr(index, "search_hybrid", None)
-                if combined is not None:
-                    return await combined(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

@@ -16,9 +16,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
-
 from pyobvector import VECTOR, VectorIndex
 from sqlalchemy import (
     BigInteger,
@@ -99,53 +96,6 @@ WHERE m.scope_id = :scope_id
   AND m.memory_artifact_id IN :memory_artifact_ids
 ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
 LIMIT :candidate_limit
-"""
-# One statement returns both candidate channels: the lexical branch uses the
-# native fulltext index and the vector branch uses the native vector index.
-# The branches keep their own candidate limit and ranking, and the application
-# re-orders each channel after the round trip.
-_OCEANBASE_HYBRID_SEARCH_SQL = """
-(SELECT
-    'fts' AS channel,
-    f.memory_artifact_id AS memory_artifact_id,
-    f.head_revision AS head_revision,
-    f.entry_id AS entry_id,
-    f.entry_version_id AS entry_version_id,
-    fv.text AS text,
-    MATCH(f.searchable_text) AGAINST(:query) AS score,
-    NULL AS distance
-FROM pc_memory_entry_heads AS f
-JOIN pc_memory_entry_versions AS fv
-  ON fv.scope_id = f.scope_id
- AND fv.memory_artifact_id = f.memory_artifact_id
- AND fv.entry_version_id = f.entry_version_id
-WHERE f.scope_id = :scope_id
-  AND f.memory_artifact_id IN :memory_artifact_ids
-  AND MATCH(f.searchable_text) AGAINST(:query)
-{fts_tag}
-ORDER BY MATCH(f.searchable_text) AGAINST(:query) DESC,
-         f.memory_artifact_id, f.entry_id, f.entry_version_id
-LIMIT :candidate_limit)
-UNION ALL
-(SELECT
-    'vector' AS channel,
-    m.memory_artifact_id AS memory_artifact_id,
-    m.head_revision AS head_revision,
-    m.entry_id AS entry_id,
-    m.entry_version_id AS entry_version_id,
-    mv.text AS text,
-    NULL AS score,
-    l2_distance(m.embedding, :query_vector) AS distance
-FROM pc_memory_vector_entries AS m
-JOIN pc_memory_entry_versions AS mv
-  ON mv.scope_id = m.scope_id
- AND mv.memory_artifact_id = m.memory_artifact_id
- AND mv.entry_version_id = m.entry_version_id
-WHERE m.scope_id = :scope_id
-  AND m.memory_artifact_id IN :memory_artifact_ids
-{vector_tag}
-ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
-LIMIT :candidate_limit)
 """
 
 
@@ -335,26 +285,6 @@ class OceanBaseMemoryVectorIndex:
             bindparam("tag_hashes", expanding=True),
             bindparam("query_vector", type_=VECTOR(profile.dimension)),
         )
-        self._hybrid_search_sql = text(
-            _OCEANBASE_HYBRID_SEARCH_SQL.format(
-                fts_tag="",
-                vector_tag="",
-            )
-        ).bindparams(
-            bindparam("memory_artifact_ids", expanding=True),
-            bindparam("query_vector", type_=VECTOR(profile.dimension)),
-        )
-        self._tagged_hybrid_search_sql = text(
-            _OCEANBASE_HYBRID_SEARCH_SQL.format(
-                fts_tag=memory_tag_sql("f"),
-                vector_tag=memory_tag_sql("m"),
-            )
-        ).bindparams(
-            bindparam("memory_artifact_ids", expanding=True),
-            bindparam("tag_keys", expanding=True),
-            bindparam("tag_hashes", expanding=True),
-            bindparam("query_vector", type_=VECTOR(profile.dimension)),
-        )
 
     async def initialize(self, connection: AsyncConnection, /) -> None:
         if connection.dialect.name != "mysql":
@@ -463,55 +393,6 @@ class OceanBaseMemoryVectorIndex:
             )
         ).mappings()
         return MemorySearchChannels(vector=memory_channel_hits(rows, request.memories))
-
-    async def search_hybrid(
-        self,
-        connection: AsyncConnection,
-        scope_id: str,
-        request: MemorySearchRequest,
-        /,
-    ) -> MemorySearchChannels:
-        """Return both candidate channels with one native statement.
-
-        The lexical branch and the vector branch keep their own native index,
-        their own database-side filters, and their own candidate limit. The
-        round trip is one statement, so the runtime does not have to ask the
-        database for the two channels separately.
-        """
-
-        if request.embedding_profile != self.profile or request.query_vector is None:
-            raise CapabilityNotSupportedError("embedding-profile")
-        if not await self.vector_complete(connection, scope_id, request.memories, self.profile):
-            raise CapabilityNotSupportedError("vector")
-        rows = (
-            await connection.execute(
-                self._hybrid_search_sql if request.tag_filter is None else self._tagged_hybrid_search_sql,
-                {
-                    "scope_id": scope_id,
-                    "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
-                    "query": request.analyzed_query,
-                    "query_vector": validate_embedding(
-                        request.query_vector,
-                        dimension=self.profile.dimension,
-                    ),
-                    "candidate_limit": request.candidate_limit,
-                    **memory_tag_parameters(request.tag_filter),
-                },
-            )
-        ).mappings()
-        lexical: list[Mapping[str, Any]] = []
-        vector: list[Mapping[str, Any]] = []
-        for row in rows:
-            target = lexical if str(row["channel"]) == "fts" else vector
-            target.append(row)
-        # The database returns both branches in one result set, so each channel
-        # is ranked again here, by the score the native index reported.
-        lexical.sort(key=lambda row: -float(row["score"]))
-        vector.sort(key=lambda row: float(row["distance"]))
-        return MemorySearchChannels(
-            fts=memory_channel_hits(lexical, request.memories),
-            vector=memory_channel_hits(vector, request.memories),
-        )
 
     async def vector_complete(
         self,
