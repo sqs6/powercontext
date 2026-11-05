@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -46,6 +48,8 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+_EVIDENCE_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_EVIDENCE_SENTENCE_PATTERN = re.compile(r"[.!?。！？](\s+|$)")
 _Item = TypeVar("_Item")
 
 
@@ -106,6 +110,65 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal excerpt of a Memory entry with its exact source range.
+
+    ``text`` is always ``entry.text[start:end]``: the excerpt is copied from the
+    entry, never rewritten, translated, or summarized.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _EvidenceEntry:
+    """One Memory candidate that may contribute literal fragments."""
+
+    scope_id: str
+    memory_ref: ArtifactRef
+    entry_id: str
+    entry_version_id: str
+    text: str
+    order: int
+
+
+@dataclass
+class _EvidenceUnit:
+    """One sentence of a candidate with its character range and query score."""
+
+    entry: _EvidenceEntry
+    start: int
+    end: int
+    tokens: frozenset[str]
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class _SelectedFragment:
+    """One chosen excerpt, rendered from its entry range."""
+
+    entry: _EvidenceEntry
+    start: int
+    end: int
+
+    @property
+    def text(self) -> str:
+        return self.entry.text[self.start : self.end]
+
+    @property
+    def address(self) -> MemoryEntryAddress:
+        return MemoryEntryAddress(
+            memory=ArtifactAddress(scope_id=self.entry.scope_id, artifact=self.entry.memory_ref),
+            entry_id=self.entry.entry_id,
+            entry_version_id=self.entry.entry_version_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -155,6 +218,7 @@ class PreparedContextBuilder:
     entry_limit = 8
     topic_memory_entry_limit = 8
     experience_entry_limit = 2
+    evidence_fragment_limit = 8
     max_entry_content_bytes = 2000
     _text_entry_limit: int | None = None
 
@@ -227,6 +291,24 @@ class PreparedContextBuilder:
                 )
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
+
+        if request.evidence_selection:
+            content, origins, fragments, omissions = self._select_evidence(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+            if content is None:
+                return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > request.max_bytes:
+                raise PreparedContextInvariantError("output-budget")
+            return PreparedContextBuild(
+                context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+                origins=origins,
+                omissions=omissions,
+                fragments=fragments,
+            )
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
@@ -432,6 +514,120 @@ class PreparedContextBuilder:
             return None, (), omissions
         content = render_context_text(included, assembly)
         return content, tuple(origins), omissions
+
+    def _select_evidence(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[
+        str | None,
+        tuple[PreparedContextOrigin, ...],
+        tuple[PreparedContextFragment, ...],
+        PreparedContextOmissions,
+    ]:
+        """Select query-relevant literal excerpts from the Memory candidates.
+
+        The excerpts are copied from the entry text, so every fragment keeps an
+        exact character range and an exact citation. The whole rendered output,
+        including the trust policy, the envelope, the citations, and the JSON,
+        has to fit the caller's byte budget.
+        """
+
+        entries: list[_EvidenceEntry] = []
+        for candidates in memory_candidates:
+            if candidates.hits and candidates.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            scope_id = candidates.scope_id or current_scope_id or ""
+            for hit in candidates.hits:
+                if hit.memory_ref != candidates.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                if not hit.text.strip():
+                    continue
+                entries.append(
+                    _EvidenceEntry(
+                        scope_id=scope_id,
+                        memory_ref=hit.memory_ref,
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                        text=hit.text,
+                        order=len(entries),
+                    )
+                )
+        if not entries:
+            return None, (), (), PreparedContextOmissions()
+
+        query_tokens = frozenset(_content_tokens(request.query))
+        units: list[_EvidenceUnit] = []
+        for entry in entries:
+            for start, end in _sentence_spans(entry.text):
+                excerpt = entry.text[start:end]
+                if not excerpt.strip():
+                    continue
+                units.append(
+                    _EvidenceUnit(
+                        entry=entry,
+                        start=start,
+                        end=end,
+                        tokens=frozenset(_content_tokens(excerpt)),
+                    )
+                )
+        if not units:
+            return None, (), (), PreparedContextOmissions()
+
+        frequency: dict[str, int] = {}
+        for unit in units:
+            for token in unit.tokens:
+                frequency[token] = frequency.get(token, 0) + 1
+        total = len(units)
+        for unit in units:
+            unit.score = sum(
+                _inverse_frequency(total, frequency.get(token, 0)) for token in unit.tokens & query_tokens
+            )
+        ordered = sorted(units, key=lambda unit: (-unit.score, unit.entry.order, unit.start))
+
+        selected: list[_SelectedFragment] = []
+        for unit in ordered:
+            if len(selected) >= self.evidence_fragment_limit:
+                break
+            index = _adjacent_fragment(selected, unit)
+            if index is None:
+                candidate = _SelectedFragment(entry=unit.entry, start=unit.start, end=unit.end)
+                trial = [*selected, candidate]
+                if _rendered_fragment_bytes(trial) <= request.max_bytes:
+                    selected.append(candidate)
+                    continue
+                # The whole sentence does not fit. A literal prefix of it still
+                # carries the query terms, so it is delivered instead of nothing.
+                shortened = _shortened_fragment(selected, candidate, request.max_bytes)
+                if shortened is not None:
+                    selected.append(shortened)
+                continue
+            existing = selected[index]
+            candidate = _SelectedFragment(
+                entry=existing.entry,
+                start=min(existing.start, unit.start),
+                end=max(existing.end, unit.end),
+            )
+            trial = [*selected[:index], candidate, *selected[index + 1 :]]
+            if _rendered_fragment_bytes(trial) <= request.max_bytes:
+                selected[index] = candidate
+
+        if not selected:
+            return None, (), (), PreparedContextOmissions()
+        selected.sort(key=lambda fragment: (fragment.entry.order, fragment.start))
+        fragments = tuple(
+            PreparedContextFragment(
+                address=fragment.address,
+                start=fragment.start,
+                end=fragment.end,
+                text=fragment.text,
+            )
+            for fragment in selected
+        )
+        origins = tuple(fragment.address for fragment in fragments)
+        return _render_fragments(selected), origins, fragments, PreparedContextOmissions()
 
     def _profile_entries(self, candidates: Sequence[PreparedProfileCandidate]) -> tuple[_PreparedContextEntry, ...]:
         entries = []
@@ -658,6 +854,114 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+def _render_fragments(fragments: Sequence[_SelectedFragment]) -> str:
+    """Render the selected excerpts with their exact citations and ranges."""
+
+    envelope = {
+        "trust": "untrusted_history",
+        "items": [
+            {
+                "citation": {
+                    "scope_id": fragment.entry.scope_id,
+                    "memory_ref": fragment.entry.memory_ref.model_dump(mode="json"),
+                    "entry_id": fragment.entry.entry_id,
+                    "entry_version_id": fragment.entry.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+            for fragment in fragments
+        ],
+    }
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _rendered_fragment_bytes(fragments: Sequence[_SelectedFragment]) -> int:
+    return len(_render_fragments(fragments).encode("utf-8"))
+
+
+def _shortened_fragment(
+    selected: Sequence[_SelectedFragment],
+    candidate: _SelectedFragment,
+    max_bytes: int,
+) -> _SelectedFragment | None:
+    """Return the longest literal prefix of one fragment that still fits."""
+
+    length = candidate.end - candidate.start
+    lower = 1
+    upper = length
+    best: _SelectedFragment | None = None
+    while lower <= upper:
+        middle = (lower + upper) // 2
+        shortened = _SelectedFragment(entry=candidate.entry, start=candidate.start, end=candidate.start + middle)
+        if _rendered_fragment_bytes([*selected, shortened]) <= max_bytes:
+            best = shortened
+            lower = middle + 1
+        else:
+            upper = middle - 1
+    if best is None:
+        return None
+    if len(best.text.encode("utf-8")) < _MIN_TRUNCATED_CONTENT_BYTES:
+        return None
+    return best
+
+
+def _adjacent_fragment(
+    fragments: Sequence[_SelectedFragment],
+    unit: _EvidenceUnit,
+) -> int | None:
+    """Return the index of the fragment this unit extends, if there is one."""
+
+    for index, fragment in enumerate(fragments):
+        if fragment.entry.order != unit.entry.order:
+            continue
+        if fragment.end == unit.start or unit.end == fragment.start:
+            return index
+    return None
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return the character ranges of the sentences of one text."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _EVIDENCE_SENTENCE_PATTERN.finditer(text):
+        end = match.start() + 1
+        if end > start:
+            spans.append((start, end))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return tuple(spans)
+
+
+def _content_tokens(text: str) -> tuple[str, ...]:
+    """Return the comparable words of one text, reduced to a shared form."""
+
+    return tuple(_stem(token) for token in _EVIDENCE_TOKEN_PATTERN.findall(text.lower()) if token)
+
+
+def _stem(token: str) -> str:
+    """Reduce one word to a shared form so that related words still match."""
+
+    if len(token) > 4:
+        if token.endswith("ies"):
+            return f"{token[:-3]}y"
+        if token.endswith(("sses", "xes", "zes", "ches", "shes")):
+            return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _inverse_frequency(total: int, frequency: int) -> float:
+    """Return how much a rare word separates one sentence from the others."""
+
+    return math.log(1 + total / (1 + frequency))
 
 
 def _interleave(
