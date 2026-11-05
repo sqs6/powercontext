@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import AnyHttpUrl, JsonValue, SecretStr
+from sqlalchemy.ext.asyncio import AsyncConnection
 from typing_extensions import override
 
 from powercontext._logging import log_safely
@@ -92,6 +93,7 @@ from powercontext.builtin.persistence.oceanbase.topic_memory_index import (
     OceanBaseTopicMemoryFTSIndex,
     OceanBaseTopicMemoryVectorIndex,
 )
+from powercontext.builtin.persistence.processing import ArtifactProcessingPendingRepository
 from powercontext.builtin.persistence.processing_migration import (
     assert_processing_schema_ready,
     bootstrap_processing_schema,
@@ -127,6 +129,7 @@ from powercontext.builtin.runtime.artifact_processing import (
     SpawnArtifactProcessingWorkerLauncher,
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
+from powercontext.builtin.runtime.count_trigger import SourceCountTrigger, SourceCountTriggerGroup
 from powercontext.builtin.runtime.decision_model import (
     DECISION_INSTRUCTIONS,
     DecisionInput,
@@ -656,6 +659,9 @@ async def open_builtin_runtime(
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        await resources.enter_async_context(
+            _open_source_count_triggers(config, contexts, runtime.artifact_processing_supervisor)
+        )
         contexts.profiles.operation_context = runtime._operation
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
@@ -851,6 +857,62 @@ async def _open_artifact_processing_supervisor(
             )
             supervisors.append(supervisor)
         yield ArtifactProcessingSupervisors(tuple(supervisors))
+
+
+@asynccontextmanager
+async def _open_source_count_triggers(
+    config: BuiltinConfig,
+    contexts: RelationalContexts,
+    supervisors: ArtifactProcessingSupervisors | None,
+) -> AsyncIterator[SourceCountTriggerGroup | None]:
+    """Admit automatic processing once pending Source entries reach a threshold.
+
+    The count is read from the committed Source cursor of one Scope and
+    Family, so a repeated capture or a trust upgrade never raises it. The
+    threshold only adds a second admission condition; the time condition keeps
+    working on its own, and an explicit flush still bypasses both.
+    """
+
+    configured = (
+        ("memory", FAMILY_BINDINGS["memory"], config.runtime.memory_source_count_threshold),
+        ("topic-memory", TOPIC_MEMORY_SOURCE_WINDOW_BINDING, config.runtime.topic_memory_source_count_threshold),
+    )
+    triggers: list[SourceCountTrigger] = []
+    for family, binding_name, threshold in configured:
+        if threshold is None:
+            continue
+        prepare = None
+        if family == "topic-memory":
+            # A Topic Memory wave freezes the accepted head before it runs.
+            prepare = partial(_prepare_topic_memory_flush, contexts.repositories.processing_pending, binding_name)
+        triggers.append(
+            SourceCountTrigger(contexts.database, binding_name=binding_name, threshold=threshold, prepare=prepare)
+        )
+    if not triggers:
+        yield None
+        return
+    if supervisors is None:
+        log_safely(
+            logger,
+            logging.WARNING,
+            "Source count thresholds are ignored without an artifact processing Supervisor",
+            extra={"event": "source_count_trigger.disabled"},
+        )
+        yield None
+        return
+    async with SourceCountTriggerGroup(triggers, wake=supervisors.wake) as group:
+        yield group
+
+
+async def _prepare_topic_memory_flush(
+    pending: ArtifactProcessingPendingRepository,
+    binding_name: str,
+    connection: AsyncConnection,
+    scope_id: str,
+) -> bool:
+    """Accept one Topic Memory wave when the Scope still owns pending Sources."""
+
+    return await pending.request_flush(connection, scope_id, binding_name) is not None
 
 
 @asynccontextmanager

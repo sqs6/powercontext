@@ -137,6 +137,10 @@ class RuntimeConfig(BaseModel):
 
     scope_cache_size: int = Field(default=DEFAULT_SCOPE_CACHE_SIZE, ge=1)
     source_window_limit: int = Field(default=100, ge=1)
+    # Optional count admission: start processing once the pending Source entries
+    # of one Scope and Family reach the threshold. None keeps the trigger off.
+    memory_source_count_threshold: int | None = None
+    topic_memory_source_count_threshold: int | None = None
     context_assembly_max_entries: int = Field(default=8, ge=1)
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False
@@ -154,6 +158,23 @@ class RuntimeConfig(BaseModel):
     memory_compaction_enabled: bool = False
     memory_compaction_min_tombstone_revisions: int = Field(default=10, ge=0)
     memory_max_history_revisions: int = Field(default=100, ge=1)
+
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def validate_source_count_threshold(cls, value: Any) -> Any:
+        """Accept only a strict positive integer or None."""
+
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Source count threshold must be a positive integer")  # noqa: TRY003
+        if value < 1:
+            raise ValueError("Source count threshold must be a positive integer")  # noqa: TRY003
+        return value
 
     @model_validator(mode="after")
     def validate_memory_capacity_order(self) -> RuntimeConfig:

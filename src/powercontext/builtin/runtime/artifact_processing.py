@@ -79,7 +79,11 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
-_DISCOVERY_TIMEOUT_SECONDS = 2.0
+# Discovery waits for the database lock while a Worker holds it. A short
+# deadline would cancel that wait inside the transaction, so the write lock
+# outlives the cancelled pass and the Worker starves behind it. The deadline
+# only bounds a stalled pass, so it stays above the storage busy timeout.
+_DISCOVERY_TIMEOUT_SECONDS = 30.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
