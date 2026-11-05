@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
@@ -44,8 +45,8 @@ PDF_PAGE_SOURCE_NAME: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_TYPE: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_VERSION: Final[str] = "1"
 _PDF_IDENTITY_PREFIX: Final[str] = "pdf:"
-_SEARCH_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z0-9]+")
 _SEARCH_CANDIDATE_LIMIT: Final[int] = 100
+_SEARCH_QUERY_LIMIT: Final[int] = 12
 
 
 class PDFDocumentInput(BaseModel):
@@ -214,24 +215,53 @@ async def search_pdf_pages(
     """Return the page citations that answer one question, most relevant first.
 
     The pages are read through the public Memory API, so every returned
-    citation resolves to a stored entry and its exact page Sources. The pages
-    are then reordered by how much of the question they cover, because the
-    lexical index alone ranks by term frequency.
+    citation resolves to a stored entry and its exact page Sources. One
+    question is asked in several ways, because a long question would
+    otherwise admit only the pages that repeat most of its words. The pages
+    are then ranked by how much of the question they cover, weighting the
+    rare words above the common ones.
     """
 
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
+    from powercontext.builtin.artifacts.search import analyze_fts_query, analyze_text
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     if limit <= 0 or not question.strip():
         return ()
-    page = await memory.search(
-        SearchMemoryRequest(query=question, mode="fts", limit=max(limit, _SEARCH_CANDIDATE_LIMIT))
-    )
-    terms = _search_terms(question)
-    scored: list[tuple[int, int, object]] = []
-    for rank, hit in enumerate(page.hits):
-        matched = len(terms & _search_terms(hit.text))
-        scored.append((-matched, rank, hit))
+    terms = tuple(dict.fromkeys(analyze_fts_query(question).split()))
+    if not terms:
+        return ()
+    queries = (question, *terms[:_SEARCH_QUERY_LIMIT])
+    pool: dict[tuple[str, str], tuple[int, object]] = {}
+    for query in queries:
+        page = await memory.search(
+            SearchMemoryRequest(query=query, mode="fts", limit=_SEARCH_CANDIDATE_LIMIT)
+        )
+        for rank, hit in enumerate(page.hits):
+            identity = (hit.entry_id, hit.entry_version_id)
+            known = pool.get(identity)
+            if known is None or rank < known[0]:
+                pool[identity] = (rank, hit)
+    if not pool:
+        return ()
+
+    query_terms = frozenset(terms)
+    frequency: dict[str, int] = {}
+    page_terms: dict[tuple[str, str], frozenset[str]] = {}
+    for identity, (_, hit) in pool.items():
+        tokens = frozenset(analyze_text(hit.text).split())
+        page_terms[identity] = tokens
+        for token in tokens & query_terms:
+            frequency[token] = frequency.get(token, 0) + 1
+    total = len(pool)
+    scored: list[tuple[float, int, object]] = []
+    for identity, (rank, hit) in pool.items():
+        matched = query_terms & page_terms[identity]
+        # A rare word separates the pages far better than a common one, and a
+        # page that covers more of the question is the better answer.
+        score = sum(math.log(1 + total / (1 + frequency.get(token, 0))) for token in matched)
+        score += len(matched)
+        scored.append((-score, rank, hit))
     scored.sort(key=lambda item: (item[0], item[1]))
     citations: list[MemoryCitation] = []
     seen: set[tuple[str, str]] = set()
@@ -250,10 +280,6 @@ async def search_pdf_pages(
         if len(citations) >= limit:
             break
     return tuple(citations)
-
-
-def _search_terms(text: str) -> frozenset[str]:
-    return frozenset(_SEARCH_TOKEN_PATTERN.findall(text.casefold()))
 
 
 __all__ = [

@@ -49,7 +49,9 @@ _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _EVIDENCE_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
-_EVIDENCE_SENTENCE_PATTERN = re.compile(r"[.!?。！？](\s+|$)")
+# A sentence ends at a punctuation mark that is followed by whitespace and the
+# start of a new sentence. "U.S. market" and "3.5 million" stay in one piece.
+_EVIDENCE_SENTENCE_PATTERN = re.compile(r"[.!?。！？]\s+(?=[A-Z\"'(\[])|[.!?。！？]\s*$")
 _Item = TypeVar("_Item")
 
 
