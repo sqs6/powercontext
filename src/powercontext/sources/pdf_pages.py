@@ -249,11 +249,20 @@ async def search_pdf_pages(
     query_terms = frozenset(terms)
     frequency: dict[str, int] = {}
     page_terms: dict[tuple[str, str], frozenset[str]] = {}
+    page_words: dict[tuple[str, str], tuple[str, ...]] = {}
     for identity, (_, hit) in pool.items():
-        tokens = frozenset(analyze_text(hit.text).split())
+        words = tuple(analyze_text(hit.text).split())
+        tokens = frozenset(words)
+        page_words[identity] = words
         page_terms[identity] = tokens
         for token in tokens & query_terms:
             frequency[token] = frequency.get(token, 0) + 1
+    # A question asks about one named measure. A page that keeps the words of
+    # that measure together is the page that states it; a page that only
+    # mentions the same words apart is not.
+    query_pairs = frozenset(
+        (terms[index], terms[index + 1]) for index in range(len(terms) - 1)
+    )
     total = len(pool)
     scored: list[tuple[float, int, object]] = []
     for identity, (rank, hit) in pool.items():
@@ -265,6 +274,11 @@ async def search_pdf_pages(
         # A financial answer lives in a table: a page that carries figures is
         # evidence, while a page that only carries prose is not.
         score += math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
+        words = page_words[identity]
+        for index in range(len(words) - 1):
+            pair = (words[index], words[index + 1])
+            if pair in query_pairs:
+                score += math.log(1 + total / (1 + frequency.get(pair[0], 0)))
         scored.append((-score, rank, hit))
     scored.sort(key=lambda item: (item[0], item[1]))
     citations: list[MemoryCitation] = []
