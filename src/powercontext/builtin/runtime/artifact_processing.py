@@ -32,7 +32,7 @@ from enum import StrEnum
 from multiprocessing.context import SpawnProcess
 from multiprocessing.process import BaseProcess
 from random import SystemRandom
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -296,6 +296,69 @@ def _wait_for_spawn_popen_exit(popen: SpawnPopen, timeout_seconds: float) -> Non
     deadline = time.monotonic() + timeout_seconds
     while popen.poll() is None and time.monotonic() < deadline:
         time.sleep(0.01)
+
+
+class InProcessArtifactProcessingWorkerLauncher:
+    """Run one Worker entrypoint inside the Runtime process.
+
+    A single-process Runtime already owns the database, the inference clients,
+    and the event loop, so it runs the domain window here instead of paying
+    for a fresh interpreter and a second schema bootstrap. The entrypoint, and
+    therefore the domain work itself, is the same one the spawned Worker uses.
+    """
+
+    def __init__(self, entrypoint: Callable[[ArtifactProcessingWorkAssignment], Awaitable[Any]]) -> None:
+        self._entrypoint = entrypoint
+
+    async def start(self, assignment: ArtifactProcessingWorkAssignment) -> ArtifactProcessingWorkerHandle:
+        task = asyncio.create_task(
+            self._entrypoint(assignment),
+            name=f"powercontext-artifact-worker-{assignment.worker_id}",
+        )
+        return _InProcessWorkerHandle(task)
+
+
+class _InProcessWorkerHandle:
+    """One Worker task whose completion is observed without leaving the process."""
+
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self._task = task
+        self._closed = False
+
+    async def wait(self) -> ArtifactProcessingWorkerCompletion:
+        try:
+            completion = await self._task
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            raise _WorkerExecutionError(
+                ArtifactProcessingWorkerFailure(
+                    stage="worker",
+                    error_code="worker_failed",
+                    exception_type=type(error).__name__,
+                    traceback=_safe_traceback(error),
+                )
+            ) from error
+        if completion is None:
+            return ArtifactProcessingWorkerCompletion()
+        if not isinstance(completion, ArtifactProcessingWorkerCompletion):
+            raise _WorkerExecutionError(
+                ArtifactProcessingWorkerFailure(
+                    stage="worker",
+                    error_code="invalid_worker_result",
+                    exception_type=type(completion).__name__,
+                    traceback="",
+                )
+            )
+        return completion
+
+    async def terminate(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
 
 
 class _SpawnedWorkerHandle:

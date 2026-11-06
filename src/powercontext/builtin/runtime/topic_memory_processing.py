@@ -1552,6 +1552,21 @@ def run_topic_memory_worker(
     return asyncio.run(_run_topic_memory_worker(spec, assignment))
 
 
+async def run_topic_memory_worker_async(
+    spec: TopicMemoryWorkerSpec,
+    assignment: ArtifactProcessingWorkAssignment,
+    /,
+) -> ArtifactProcessingWorkerCompletion:
+    """Run one Topic Memory window in the caller's event loop.
+
+    The wave is the same one the spawned Worker performs. This entry point
+    exists for a single-process Runtime that already owns the database and the
+    inference clients, so it does not pay for a second interpreter.
+    """
+
+    return await _run_topic_memory_worker(spec, assignment)
+
+
 async def _run_topic_memory_worker(
     spec: TopicMemoryWorkerSpec,
     assignment: ArtifactProcessingWorkAssignment,

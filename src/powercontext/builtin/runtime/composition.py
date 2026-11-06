@@ -126,6 +126,7 @@ from powercontext.builtin.runtime.artifact_processing import (
     ArtifactProcessingBinding,
     ArtifactProcessingSupervisor,
     ArtifactProcessingSupervisors,
+    InProcessArtifactProcessingWorkerLauncher,
     SpawnArtifactProcessingWorkerLauncher,
 )
 from powercontext.builtin.runtime.config import BuiltinConfig, ExternalSkillsConfig, InferenceConfig, RuntimeConfig
@@ -140,7 +141,12 @@ from powercontext.builtin.runtime.decision_model import (
     FailOpenDecisionModel,
     LLMDecisionModel,
 )
-from powercontext.builtin.runtime.family_processing import FAMILY_BINDINGS, FamilyWorkerSpec, run_family_worker
+from powercontext.builtin.runtime.family_processing import (
+    FAMILY_BINDINGS,
+    FamilyWorkerSpec,
+    run_family_worker,
+    run_family_worker_async,
+)
 from powercontext.builtin.runtime.memory_write_gate import build_memory_write_gate
 from powercontext.builtin.runtime.models import MemorySearchMode, RuntimeCapabilities
 from powercontext.builtin.runtime.processing_discovery import SourceProcessingPendingProvider, enabled_profile_scopes
@@ -162,6 +168,7 @@ from powercontext.builtin.runtime.relational import RelationalContexts
 from powercontext.builtin.runtime.topic_memory_processing import (
     TopicMemoryWorkerSpec,
     run_topic_memory_worker,
+    run_topic_memory_worker_async,
     validate_topic_memory_provider_settings,
 )
 from powercontext.builtin.sources import (
@@ -770,18 +777,20 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 validate_topic_memory_stage_capacity(budget, contexts.token_estimator)
             except TopicMemoryGenerationError as error:
                 raise BuiltinConfigurationError("topic-memory-generation-budget") from error
-            entrypoint = partial(
-                run_topic_memory_worker, TopicMemoryWorkerSpec(config=config, worker_security=worker_security)
-            )
+            spec = TopicMemoryWorkerSpec(config=config, worker_security=worker_security)
+            entrypoint = partial(run_topic_memory_worker, spec)
+            inline_entrypoint = partial(run_topic_memory_worker_async, spec)
         else:
-            entrypoint = partial(run_family_worker, FamilyWorkerSpec(config=config, worker_security=worker_security))
+            spec = FamilyWorkerSpec(config=config, worker_security=worker_security)
+            entrypoint = partial(run_family_worker, spec)
+            inline_entrypoint = partial(run_family_worker_async, spec)
         interval = None if family == "profile" else automatic[family]
         binding = canonical[family]
         configured.append(
             ArtifactProcessingBinding(
                 binding_name=binding,
                 artifact_family=family,
-                launcher=SpawnArtifactProcessingWorkerLauncher(entrypoint),
+                launcher=_worker_launcher(config, entrypoint, inline_entrypoint),
                 max_workers=getattr(config.runtime, f"{prefix}_max_workers"),
                 worker_timeout_seconds=getattr(config.runtime, f"{prefix}_worker_timeout_seconds"),
                 automatic_processing_interval=None if interval is None else timedelta(seconds=float(interval)),
@@ -797,6 +806,24 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
         )
     _validate_processing_registrations(configured)
     return tuple(configured)
+
+
+def _worker_launcher(
+    config: BuiltinConfig,
+    entrypoint: Callable[[ArtifactProcessingWorkAssignment], ArtifactProcessingWorkerCompletion],
+    inline_entrypoint: Callable[[ArtifactProcessingWorkAssignment], Awaitable[ArtifactProcessingWorkerCompletion]],
+) -> ArtifactProcessingWorkerLauncher:
+    """Choose how one Family runs its Worker.
+
+    A Runtime that serves every role already owns the database and the
+    inference clients, so its Worker runs in the same process and starts
+    without a second interpreter or a second schema bootstrap. A Runtime that
+    only serves the API hands the window to a spawned Worker instead.
+    """
+
+    if config.runtime.artifact_processing_role == "all":
+        return InProcessArtifactProcessingWorkerLauncher(inline_entrypoint)
+    return SpawnArtifactProcessingWorkerLauncher(entrypoint)
 
 
 def _validate_processing_registrations(configured: Sequence[ArtifactProcessingBinding]) -> None:

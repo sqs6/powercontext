@@ -70,6 +70,19 @@ def run_family_worker(
     return asyncio.run(_run_family_worker(spec, assignment))
 
 
+async def run_family_worker_async(
+    spec: FamilyWorkerSpec, assignment: ArtifactProcessingWorkAssignment, /
+) -> ArtifactProcessingWorkerCompletion:
+    """Run one Memory or Experience window in the caller's event loop.
+
+    The domain work is the same one the spawned Worker performs. This entry
+    point exists for a single-process Runtime that already owns the database
+    and the inference clients, so it does not pay for a second interpreter.
+    """
+
+    return await _run_family_worker(spec, assignment)
+
+
 async def _run_family_worker(
     spec: FamilyWorkerSpec, assignment: ArtifactProcessingWorkAssignment
 ) -> ArtifactProcessingWorkerCompletion:
