@@ -169,6 +169,9 @@ from powercontext.builtin.runtime._scope_cache import (
 from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
+from powercontext.builtin.runtime.source_lifecycle import (
+    SourceLifecycleService,
+)
 from powercontext.builtin.runtime.models import (
     ApproveArtifactCandidateRequest,
     CaptureSource,
@@ -2632,6 +2635,16 @@ class ScopedMemoryApplication:
             return await context.triggers.cursor()
 
 
+class SourceLifecycleApplication:
+    """Select the source lifecycle service of one Scope."""
+
+    def __init__(self, runtime: BuiltinRuntime) -> None:
+        self._runtime = runtime
+
+    def for_scope(self, scope_id: str, /) -> SourceLifecycleService:
+        return SourceLifecycleService(self._runtime, validate_scope_id(scope_id))
+
+
 class MemoryApplication:
     """Select the application service for one Memory family scope."""
 
@@ -3140,6 +3153,7 @@ class BuiltinRuntime:
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
