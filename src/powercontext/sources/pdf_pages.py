@@ -45,8 +45,9 @@ PDF_PAGE_SOURCE_NAME: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_TYPE: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_VERSION: Final[str] = "1"
 _PDF_IDENTITY_PREFIX: Final[str] = "pdf:"
-_SEARCH_CANDIDATE_LIMIT: Final[int] = 100
+_SEARCH_CANDIDATE_LIMIT: Final[int] = 200
 _SEARCH_QUERY_LIMIT: Final[int] = 12
+_SEARCH_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d")
 
 
 class PDFDocumentInput(BaseModel):
@@ -261,6 +262,9 @@ async def search_pdf_pages(
         # page that covers more of the question is the better answer.
         score = sum(math.log(1 + total / (1 + frequency.get(token, 0))) for token in matched)
         score += len(matched)
+        # A financial answer lives in a table: a page that carries figures is
+        # evidence, while a page that only carries prose is not.
+        score += math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
         scored.append((-score, rank, hit))
     scored.sort(key=lambda item: (item[0], item[1]))
     citations: list[MemoryCitation] = []

@@ -587,18 +587,38 @@ class PreparedContextBuilder:
             unit.score = sum(
                 _inverse_frequency(total, frequency.get(token, 0)) for token in unit.tokens & query_tokens
             )
-        ordered = sorted(units, key=lambda unit: (-unit.score, unit.entry.order, unit.start))
 
+        # The question's terms are covered one sentence at a time: the next pick
+        # is the sentence that still covers the most uncovered question terms,
+        # weighted by how rare those terms are. Once the question is covered the
+        # remaining budget goes to the strongest sentences left.
+        remaining = set(query_tokens)
+        pool = list(units)
         selected: list[_SelectedFragment] = []
-        for unit in ordered:
-            if len(selected) >= self.evidence_fragment_limit:
+        while pool and len(selected) < self.evidence_fragment_limit:
+            best: _EvidenceUnit | None = None
+            best_score = 0.0
+            for unit in pool:
+                uncovered = unit.tokens & remaining
+                score = (
+                    sum(_inverse_frequency(total, frequency.get(token, 0)) for token in uncovered)
+                    if uncovered
+                    else unit.score
+                )
+                if score > best_score:
+                    best = unit
+                    best_score = score
+            if best is None:
                 break
+            pool.remove(best)
+            unit = best
             index = _adjacent_fragment(selected, unit)
             if index is None:
                 candidate = _SelectedFragment(entry=unit.entry, start=unit.start, end=unit.end)
                 trial = [*selected, candidate]
                 if _rendered_fragment_bytes(trial) <= request.max_bytes:
                     selected.append(candidate)
+                    remaining -= unit.tokens & query_tokens
                     continue
                 # The whole sentence does not fit. A literal prefix of it still
                 # carries the query terms, so it is delivered instead of nothing.
@@ -615,6 +635,7 @@ class PreparedContextBuilder:
             trial = [*selected[:index], candidate, *selected[index + 1 :]]
             if _rendered_fragment_bytes(trial) <= request.max_bytes:
                 selected[index] = candidate
+                remaining -= unit.tokens & query_tokens
 
         if not selected:
             return None, (), (), PreparedContextOmissions()
