@@ -45,9 +45,31 @@ PDF_PAGE_SOURCE_NAME: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_TYPE: Final[str] = "pdf-page"
 PDF_PAGE_SOURCE_VERSION: Final[str] = "1"
 _PDF_IDENTITY_PREFIX: Final[str] = "pdf:"
-_SEARCH_CANDIDATE_LIMIT: Final[int] = 200
-_SEARCH_QUERY_LIMIT: Final[int] = 12
+_SEARCH_CANDIDATE_LIMIT: Final[int] = 600
+_SEARCH_QUERY_LIMIT: Final[int] = 60
 _SEARCH_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d")
+_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^fy(\d{4})$")
+
+
+def _reduce_word(word: str) -> str:
+    """Reduce a word to the form that lets two spellings meet.
+
+    A fiscal year is written "FY2022" in a question and "2022" in a report, and
+    a question says "geographies" where the report says "geographic".
+    """
+
+    year = _YEAR_PATTERN.match(word)
+    if year is not None:
+        return year.group(1)
+    if len(word) > 5 and word.endswith("ies"):
+        return f"{word[:-3]}y"
+    if len(word) > 5 and word.endswith("ing"):
+        return word[:-3]
+    if len(word) > 5 and word.endswith("ed"):
+        return word[:-2]
+    if len(word) > 4 and word.endswith("s"):
+        return word[:-1]
+    return word
 
 
 class PDFDocumentInput(BaseModel):
@@ -224,7 +246,7 @@ async def search_pdf_pages(
     """
 
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
-    from powercontext.builtin.artifacts.search import analyze_fts_query, analyze_text
+    from powercontext.builtin.artifacts.search import AdmissionFloor, analyze_fts_query, analyze_text
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     if limit <= 0 or not question.strip():
@@ -232,27 +254,41 @@ async def search_pdf_pages(
     terms = tuple(dict.fromkeys(analyze_fts_query(question).split()))
     if not terms:
         return ()
+    # The page that answers a question often shares only one word with it, and
+    # the shared admission floor would drop that page before it can be ranked.
+    # The lookups therefore run with the floor removed, and the ranking below
+    # decides which of the reached pages are the evidence.
     queries = (question, *terms[:_SEARCH_QUERY_LIMIT])
     pool: dict[tuple[str, str], tuple[int, object]] = {}
-    for query in queries:
-        page = await memory.search(
-            SearchMemoryRequest(query=query, mode="fts", limit=_SEARCH_CANDIDATE_LIMIT)
-        )
-        for rank, hit in enumerate(page.hits):
-            identity = (hit.entry_id, hit.entry_version_id)
-            known = pool.get(identity)
-            if known is None or rank < known[0]:
-                pool[identity] = (rank, hit)
-    if not pool:
-        return ()
+    async with memory._runtime._context(memory.scope_id) as context:
+        service = context.artifacts.memory
+        head = await service.head(context.artifacts.memory_artifact_id)
+        for query in queries:
+            outcome = await service.search(
+                query,
+                memories=(head,),
+                limit=_SEARCH_CANDIDATE_LIMIT,
+                mode="fts",
+                admission=AdmissionFloor(lexical_coverage=0.0, lexical_min_matched_terms=1),
+            )
+            for rank, hit in enumerate(outcome.hits):
+                identity = (hit.entry_id, hit.entry_version_id)
+                known = pool.get(identity)
+                if known is None or rank < known[0]:
+                    pool[identity] = (rank, hit)
 
     query_terms = frozenset(terms)
+    # The index keeps the words of a page as they are written, so a question
+    # word and the page word that answers it often differ only in their ending
+    # ("geographies" and "geographic", "fy2022" and "2022"). The comparison is
+    # made on the reduced form of both sides.
+    query_terms = frozenset(_reduce_word(term) for term in query_terms)
     frequency: dict[str, int] = {}
     page_terms: dict[tuple[str, str], frozenset[str]] = {}
     page_words: dict[tuple[str, str], tuple[str, ...]] = {}
     for identity, (_, hit) in pool.items():
         words = tuple(analyze_text(hit.text).split())
-        tokens = frozenset(words)
+        tokens = frozenset(_reduce_word(word) for word in words)
         page_words[identity] = words
         page_terms[identity] = tokens
         for token in tokens & query_terms:
@@ -261,7 +297,8 @@ async def search_pdf_pages(
     # that measure together is the page that states it; a page that only
     # mentions the same words apart is not.
     query_pairs = frozenset(
-        (terms[index], terms[index + 1]) for index in range(len(terms) - 1)
+        (_reduce_word(terms[index]), _reduce_word(terms[index + 1]))
+        for index in range(len(terms) - 1)
     )
     total = len(pool)
     scored: list[tuple[float, int, object]] = []
@@ -270,13 +307,13 @@ async def search_pdf_pages(
         # A rare word separates the pages far better than a common one, and a
         # page that covers more of the question is the better answer.
         score = sum(math.log(1 + total / (1 + frequency.get(token, 0))) for token in matched)
-        score += len(matched)
+        score += 3.0 * len(matched)
         # A financial answer lives in a table: a page that carries figures is
         # evidence, while a page that only carries prose is not.
         score += math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
         words = page_words[identity]
         for index in range(len(words) - 1):
-            pair = (words[index], words[index + 1])
+            pair = (_reduce_word(words[index]), _reduce_word(words[index + 1]))
             if pair in query_pairs:
                 score += math.log(1 + total / (1 + frequency.get(pair[0], 0)))
         scored.append((-score, rank, hit))
@@ -312,3 +349,4 @@ __all__ = [
     "pdf_page_source_id",
     "search_pdf_pages",
 ]
+
