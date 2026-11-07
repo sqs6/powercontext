@@ -52,6 +52,7 @@ _SEARCH_MULTI_MATCH_BONUS: Final[float] = 2.0
 _SEARCH_NUMBER_WEIGHT: Final[float] = 6.0
 _SEARCH_PAGE_LIMIT: Final[int] = 4000
 _SEARCH_FUSION_K: Final[int] = 10
+_SEARCH_LEXICAL_WEIGHT: Final[float] = 1.5
 _SEARCH_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d")
 _YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^fy(\d{4})$")
 
@@ -303,9 +304,12 @@ async def search_pdf_pages(
     lexical_order = sorted(range(len(records)), key=lambda index: -lexical[index])
     structural_order = sorted(range(len(records)), key=lambda index: -structural[index])
     fused: dict[int, float] = {}
-    for order in (lexical_order, structural_order):
+    for order, weight in (
+        (lexical_order, _SEARCH_LEXICAL_WEIGHT),
+        (structural_order, 1.0),
+    ):
         for rank, index in enumerate(order, start=1):
-            fused[index] = fused.get(index, 0.0) + 1.0 / (_SEARCH_FUSION_K + rank)
+            fused[index] = fused.get(index, 0.0) + weight / (_SEARCH_FUSION_K + rank)
 
     citations: list[MemoryCitation] = []
     for index in sorted(fused, key=lambda item: -fused[item]):
