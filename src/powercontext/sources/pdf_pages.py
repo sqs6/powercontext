@@ -47,10 +47,11 @@ PDF_PAGE_SOURCE_VERSION: Final[str] = "1"
 _PDF_IDENTITY_PREFIX: Final[str] = "pdf:"
 _SEARCH_CANDIDATE_LIMIT: Final[int] = 600
 _SEARCH_QUERY_LIMIT: Final[int] = 60
-_SEARCH_MATCHED_WEIGHT: Final[float] = 0.5
-_SEARCH_MULTI_MATCH_BONUS: Final[float] = 0.0
-_SEARCH_NUMBER_WEIGHT: Final[float] = 1.0
-_SEARCH_PAIR_WEIGHT: Final[float] = 0.0
+_SEARCH_MATCHED_WEIGHT: Final[float] = 1.0
+_SEARCH_MULTI_MATCH_BONUS: Final[float] = 2.0
+_SEARCH_NUMBER_WEIGHT: Final[float] = 6.0
+_SEARCH_PAGE_LIMIT: Final[int] = 4000
+_SEARCH_FUSION_K: Final[int] = 10
 _SEARCH_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d")
 _YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^fy(\d{4})$")
 
@@ -242,111 +243,74 @@ async def search_pdf_pages(
     """Return the page citations that answer one question, most relevant first.
 
     The pages are read through the public Memory API, so every returned
-    citation resolves to a stored entry and its exact page Sources. One
-    question is asked in several ways, because a long question would
-    otherwise admit only the pages that repeat most of its words. The pages
-    are then ranked by how much of the question they cover, weighting the
-    rare words above the common ones.
+    citation resolves to a stored entry and its exact page Sources. A
+    financial question is answered either by a table of figures or by a
+    paragraph of prose, and the two are found by different signs: a table
+    carries figures, a paragraph repeats the words of the question. Both
+    orders are therefore produced and fused by their ranks, so a page that
+    only one of them finds still reaches the result.
     """
 
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
-    from powercontext.builtin.artifacts.search import AdmissionFloor, analyze_fts_query, analyze_text
-    from powercontext.builtin.runtime.models import SearchMemoryRequest
+    from powercontext.builtin.artifacts.search import analyze_fts_query, analyze_text
 
     if limit <= 0 or not question.strip():
         return ()
     terms = tuple(dict.fromkeys(analyze_fts_query(question).split()))
     if not terms:
         return ()
-    # The page that answers a question often shares only one word with it, and
-    # the shared admission floor would drop that page before it can be ranked.
-    # The lookups therefore run with the floor removed, and the ranking below
-    # decides which of the reached pages are the evidence.
-    queries = (question, *terms[:_SEARCH_QUERY_LIMIT])
-    pool: dict[tuple[str, str], tuple[int, object]] = {}
-    async with memory._runtime._context(memory.scope_id) as context:
-        service = context.artifacts.memory
-        head = await service.head(context.artifacts.memory_artifact_id)
-        for query in queries:
-            outcome = await service.search(
-                query,
-                memories=(head,),
-                limit=_SEARCH_CANDIDATE_LIMIT,
-                # A deployment without an embedding model keeps the lexical
-                # channel; the semantic channel needs one that is verified
-                # end to end before it is used here.
-                mode="fts",
-                admission=AdmissionFloor(lexical_coverage=0.0, lexical_min_matched_terms=1),
-            )
-            for rank, hit in enumerate(outcome.hits):
-                identity = (hit.entry_id, hit.entry_version_id)
-                known = pool.get(identity)
-                if known is None or rank < known[0]:
-                    pool[identity] = (rank, hit)
+    query_terms = frozenset(_reduce_word(term) for term in terms)
 
-    query_terms = frozenset(terms)
-    # The index keeps the words of a page as they are written, so a question
-    # word and the page word that answers it often differ only in their ending
-    # ("geographies" and "geographic", "fy2022" and "2022"). The comparison is
-    # made on the reduced form of both sides.
-    query_terms = frozenset(_reduce_word(term) for term in query_terms)
+    listed = await memory.list()
+    records = tuple(listed.entries)[:_SEARCH_PAGE_LIMIT]
+    if not records:
+        return ()
+
+    page_terms: list[frozenset[str]] = []
+    page_words: list[tuple[str, ...]] = []
+    for record in records:
+        words = tuple(analyze_text(record.entry.text).split())
+        page_words.append(words)
+        page_terms.append(frozenset(_reduce_word(word) for word in words))
+
     frequency: dict[str, int] = {}
-    page_terms: dict[tuple[str, str], frozenset[str]] = {}
-    page_words: dict[tuple[str, str], tuple[str, ...]] = {}
-    for identity, (_, hit) in pool.items():
-        words = tuple(analyze_text(hit.text).split())
-        tokens = frozenset(_reduce_word(word) for word in words)
-        page_words[identity] = words
-        page_terms[identity] = tokens
+    for tokens in page_terms:
         for token in tokens & query_terms:
             frequency[token] = frequency.get(token, 0) + 1
-    # A question asks about one named measure. A page that keeps the words of
-    # that measure together is the page that states it; a page that only
-    # mentions the same words apart is not.
-    query_pairs = frozenset(
-        (_reduce_word(terms[index]), _reduce_word(terms[index + 1]))
-        for index in range(len(terms) - 1)
-    )
-    total = len(pool)
-    scored: list[tuple[float, int, object]] = []
-    for identity, (rank, hit) in pool.items():
-        matched = query_terms & page_terms[identity]
-        # A rare word separates the pages far better than a common one. The
-        # number of matched words only breaks ties: a page that repeats three
-        # common words says less about the question than a page that carries
-        # the one rare word it names.
-        score = sum(math.log(1 + total / (1 + frequency.get(token, 0))) for token in matched)
+    size = len(page_terms)
+
+    lexical: list[float] = []
+    structural: list[float] = []
+    for index, tokens in enumerate(page_terms):
+        matched = query_terms & tokens
+        # The lexical lane: the words of the question, rare ones first.
+        score = sum(
+            math.log(1 + size / (1 + frequency.get(token, 0))) for token in matched
+        )
         score += _SEARCH_MATCHED_WEIGHT * len(matched)
         if len(matched) >= 2:
-            # A page that answers the question repeats more than one of its
-            # words, even when those words are rare.
             score += _SEARCH_MULTI_MATCH_BONUS
-        # A financial answer lives in a table: a page that carries figures is
-        # evidence, while a page that only carries prose is not.
-        score += _SEARCH_NUMBER_WEIGHT * math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
-        words = page_words[identity]
-        for index in range(len(words) - 1):
-            pair = (_reduce_word(words[index]), _reduce_word(words[index + 1]))
-            if pair in query_pairs:
-                score += _SEARCH_PAIR_WEIGHT * math.log(
-                    1 + total / (1 + frequency.get(pair[0], 0))
-                )
-        scored.append((-score, rank, hit))
-    scored.sort(key=lambda item: (item[0], item[1]))
-    citations: list[MemoryCitation] = []
-    seen: set[tuple[str, str]] = set()
-    for _, _, hit in scored:
-        identity = (hit.entry_id, hit.entry_version_id)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        citations.append(
-            MemoryCitation(
-                memory_ref=hit.memory_ref,
-                entry_id=hit.entry_id,
-                entry_version_id=hit.entry_version_id,
-            )
+        lexical.append(score)
+        # The structural lane: a page that answers a financial question
+        # carries figures, and the more of its words are figures the more it
+        # reads like the statement that holds the answer.
+        words = page_words[index]
+        structural.append(
+            _SEARCH_NUMBER_WEIGHT
+            * (len(_SEARCH_NUMBER_PATTERN.findall(records[index].entry.text)) / max(1, len(words)))
         )
+
+    lexical_order = sorted(range(len(records)), key=lambda index: -lexical[index])
+    structural_order = sorted(range(len(records)), key=lambda index: -structural[index])
+    fused: dict[int, float] = {}
+    for order in (lexical_order, structural_order):
+        for rank, index in enumerate(order, start=1):
+            fused[index] = fused.get(index, 0.0) + 1.0 / (_SEARCH_FUSION_K + rank)
+
+    citations: list[MemoryCitation] = []
+    for index in sorted(fused, key=lambda item: -fused[item]):
+        record = records[index]
+        citations.append(record.citation)
         if len(citations) >= limit:
             break
     return tuple(citations)
