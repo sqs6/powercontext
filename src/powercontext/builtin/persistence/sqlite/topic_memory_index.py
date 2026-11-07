@@ -384,6 +384,19 @@ class SQLiteTopicMemoryFTSIndex:
                 },
             )
 
+    async def suspend(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """Withdraw one Topic from the lexical channels without touching its history."""
+
+        identity = {"scope_id": scope_id, "artifact_id": topic_ref.artifact_id}
+        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
+        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -597,6 +610,17 @@ class SQLiteTopicMemoryVectorIndex:
                     ),
                 },
             )
+
+    async def suspend(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        # The vector channel keeps its rows; the lexical channel decides
+        # whether a withdrawn Topic is still offered.
+        pass
 
     async def search(
         self,

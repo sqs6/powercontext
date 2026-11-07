@@ -441,6 +441,15 @@ SOURCE_CURSORS_TABLE = Table(
     CheckConstraint("generation >= 0", name="ck_pc_source_cursors_generation_nonnegative"),
 )
 
+SOURCE_LIFECYCLE_TABLE = Table(
+    "pc_source_lifecycle",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("state", _canonical_payload_type(), nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    CheckConstraint("generation >= 0", name="ck_pc_source_lifecycle_generation_nonnegative"),
+)
+
 ARTIFACT_PROCESSING_PENDING_TABLE = Table(
     "pc_artifact_processing_pending",
     SHARED_METADATA,
@@ -907,6 +916,7 @@ SHARED_TABLES = (
     ARTIFACT_CANDIDATE_HEADS_TABLE,
     PROFILE_POLICIES_TABLE,
     SOURCE_CURSORS_TABLE,
+    SOURCE_LIFECYCLE_TABLE,
     ARTIFACT_PROCESSING_LEASES_TABLE,
     ARTIFACT_PROCESSING_BINDING_STATES_TABLE,
     TOPIC_MEMORY_WORK_BUDGETS_TABLE,

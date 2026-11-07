@@ -164,6 +164,17 @@ class OceanBaseTopicMemoryFTSIndex:
     ) -> None:
         pass
 
+    async def suspend(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        # The OceanBase Topic search reads the active Topic rows directly, so
+        # withdrawing the active rows is enough to hide this Topic.
+        pass
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -447,6 +458,17 @@ class OceanBaseTopicMemoryVectorIndex:
                 for chunk, embedding in zip(projection.chunks, projection.chunk_embeddings, strict=True)
             ],
         )
+
+    async def suspend(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        # The OceanBase Topic search reads the active Topic rows directly, so
+        # withdrawing the active rows is enough to hide this Topic.
+        pass
 
     async def search(
         self,

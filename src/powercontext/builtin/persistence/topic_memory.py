@@ -244,6 +244,21 @@ class TopicMemoryRepository:
             current_artifact=topic.as_ref(),
         )
 
+    async def suspend_topic(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        artifact_id: str,
+        /,
+    ) -> None:
+        """Withdraw one Topic from the searchable channels without deleting its history."""
+
+        await self.index.suspend(
+            connection,
+            scope_id,
+            ArtifactRef(family=TopicMemory.family, artifact_id=artifact_id, revision=1),
+        )
+
     async def publish_revision(
         self,
         connection: AsyncConnection,
