@@ -47,6 +47,10 @@ PDF_PAGE_SOURCE_VERSION: Final[str] = "1"
 _PDF_IDENTITY_PREFIX: Final[str] = "pdf:"
 _SEARCH_CANDIDATE_LIMIT: Final[int] = 600
 _SEARCH_QUERY_LIMIT: Final[int] = 60
+_SEARCH_MATCHED_WEIGHT: Final[float] = 0.5
+_SEARCH_MULTI_MATCH_BONUS: Final[float] = 0.0
+_SEARCH_NUMBER_WEIGHT: Final[float] = 1.0
+_SEARCH_PAIR_WEIGHT: Final[float] = 0.0
 _SEARCH_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\d")
 _YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^fy(\d{4})$")
 
@@ -307,18 +311,26 @@ async def search_pdf_pages(
     scored: list[tuple[float, int, object]] = []
     for identity, (rank, hit) in pool.items():
         matched = query_terms & page_terms[identity]
-        # A rare word separates the pages far better than a common one, and a
-        # page that covers more of the question is the better answer.
+        # A rare word separates the pages far better than a common one. The
+        # number of matched words only breaks ties: a page that repeats three
+        # common words says less about the question than a page that carries
+        # the one rare word it names.
         score = sum(math.log(1 + total / (1 + frequency.get(token, 0))) for token in matched)
-        score += 3.0 * len(matched)
+        score += _SEARCH_MATCHED_WEIGHT * len(matched)
+        if len(matched) >= 2:
+            # A page that answers the question repeats more than one of its
+            # words, even when those words are rare.
+            score += _SEARCH_MULTI_MATCH_BONUS
         # A financial answer lives in a table: a page that carries figures is
         # evidence, while a page that only carries prose is not.
-        score += math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
+        score += _SEARCH_NUMBER_WEIGHT * math.log(1 + len(_SEARCH_NUMBER_PATTERN.findall(hit.text)))
         words = page_words[identity]
         for index in range(len(words) - 1):
             pair = (_reduce_word(words[index]), _reduce_word(words[index + 1]))
             if pair in query_pairs:
-                score += math.log(1 + total / (1 + frequency.get(pair[0], 0)))
+                score += _SEARCH_PAIR_WEIGHT * math.log(
+                    1 + total / (1 + frequency.get(pair[0], 0))
+                )
         scored.append((-score, rank, hit))
     scored.sort(key=lambda item: (item[0], item[1]))
     citations: list[MemoryCitation] = []
