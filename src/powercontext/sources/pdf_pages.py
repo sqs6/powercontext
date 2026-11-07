@@ -268,6 +268,9 @@ async def search_pdf_pages(
                 query,
                 memories=(head,),
                 limit=_SEARCH_CANDIDATE_LIMIT,
+                # A deployment without an embedding model keeps the lexical
+                # channel; the semantic channel needs one that is verified
+                # end to end before it is used here.
                 mode="fts",
                 admission=AdmissionFloor(lexical_coverage=0.0, lexical_min_matched_terms=1),
             )
