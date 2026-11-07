@@ -266,8 +266,12 @@ class SourceLifecycleService:
                     raise SourceLifecycleError("unknown-parent", parent)
             if node_id in node.parents:
                 raise SourceLifecycleError("self-cycle", node_id)
+        previous = {node_id: node.available for node_id, node in state.nodes.items()}
         state.nodes[node_id] = node
         _recompute(state, node_id)
+        # A derivative registered under withdrawn evidence is unusable from the
+        # start, so the native state has to follow the new availability.
+        await self._apply_native(previous, state, "registered")
         await self._persist(state, generation)
 
     # ------------------------------------------------------------- lifecycle
@@ -382,7 +386,7 @@ class SourceLifecycleService:
             await records.replace_artifact(
                 "topic-memory",
                 artifact_id,
-                record.content_digest,
+                f'"revision:{record.revision}"',
                 _artifact_write(record.content),
             )
             return
