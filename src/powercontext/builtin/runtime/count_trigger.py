@@ -101,7 +101,9 @@ class SourceCountTrigger:
                 if pending < self._threshold:
                     continue
                 intent = await self._intents.load(connection, scope_id, self._binding_name)
-                if intent is None or intent.requested_generation > intent.handled_generation:
+                if intent is not None and intent.requested_generation > intent.handled_generation:
+                    # A request is still open, so this Scope is already being
+                    # worked on and must not be requested a second time.
                     continue
                 if self._prepare is not None and not await self._prepare(connection, scope_id):
                     continue
